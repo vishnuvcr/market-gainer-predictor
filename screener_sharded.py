@@ -252,8 +252,9 @@ def run_train_and_screen():
         )
         search.fit(X_train, y_train)
 
-        # Slice 1D positive class probability
-        probs = search.best_estimator_.predict_proba(X_test)
+        # Extract 1D positive class probabilities cleanly
+        raw_probs = search.best_estimator_.predict_proba(X_test)
+        probs = np.take(raw_probs, 1, axis=1)
         preds = (probs >= 0.50).astype(int)
 
         roc = roc_auc_score(y_test, probs) if len(np.unique(y_test)) > 1 else 0.5
@@ -271,15 +272,17 @@ def run_train_and_screen():
     ensemble = VotingClassifier(estimators=estimators, voting="soft", weights=norm_weights)
     ensemble.fit(X_train, y_train)
 
-    # Slice 1D positive class probability for ensemble
-    ens_probs = ensemble.predict_proba(X_test)
+    # 1D positive class probabilities for ensemble
+    raw_ens_probs = ensemble.predict_proba(X_test)
+    ens_probs = np.take(raw_ens_probs, 1, axis=1)
     ens_roc = roc_auc_score(y_test, ens_probs) if len(np.unique(y_test)) > 1 else 0.5
     print(f"\nFinal Ensemble Holdout ROC-AUC: {ens_roc:.4f}")
 
     # Forward-Looking Inference
     print("\n--- Running Inference for Tomorrow's Market Gainers ---")
     latest_features = latest_snapshots[FEATURE_COLS].astype(float).values
-    predictions = ensemble.predict_proba(latest_features)
+    raw_predictions = ensemble.predict_proba(latest_features)
+    predictions = np.take(raw_predictions, 1, axis=1)
 
     latest_snapshots["Surge_Probability"] = predictions
     latest_snapshots["Target_5pct"] = latest_snapshots["Close"] * 1.05
