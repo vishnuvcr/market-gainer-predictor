@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: # Divides 1,800 tickers into 4 parallel workers
+        shard:
 
     steps:
       - name: Checkout Code
@@ -29,10 +29,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
 
       - name: Install Dependencies
         run: |
-          pip install numpy pandas yfinance pyarrow fastparquet
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Download & Compute Shard ${{ matrix.shard }}
         run: |
@@ -76,7 +78,6 @@ jobs:
       - name: Merge Shard Files
         run: |
           mkdir -p artifacts/shards
-          # Flatten downloaded artifact subdirectories into artifacts/shards/
           find artifacts/downloaded_shards -name "*.parquet" -exec cp {} artifacts/shards/ \;
           ls -lh artifacts/shards/
 
