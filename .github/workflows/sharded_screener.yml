@@ -1,0 +1,97 @@
+name: Sharded NSE Market Gainers Screener
+
+on:
+  schedule:
+    # 11:00 UTC = 16:30 IST (Monday - Friday, after NSE market close)
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================================
+  # JOB 1: Parallel Matrix Shards for High-Speed Downloads
+  # ==========================================================
+  download-shards:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: # Divides 1,800 tickers into 4 parallel workers
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install numpy pandas yfinance pyarrow fastparquet
+
+      - name: Download & Compute Shard ${{ matrix.shard }}
+        run: |
+          python screener_sharded.py --mode download --shard-index ${{ matrix.shard }} --total-shards 4 --workers 8
+
+      - name: Upload Shard Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: artifacts/shards/
+          retention-days: 1
+
+  # ==========================================================
+  # JOB 2: Aggregate Shards, Fit Ensemble & Predict Gainers
+  # ==========================================================
+  aggregate-and-predict:
+    needs: download-shards
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install numpy pandas scikit-learn pyarrow fastparquet
+
+      - name: Download All Shard Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/downloaded_shards
+
+      - name: Merge Shard Files
+        run: |
+          mkdir -p artifacts/shards
+          # Flatten downloaded artifact subdirectories into artifacts/shards/
+          find artifacts/downloaded_shards -name "*.parquet" -exec cp {} artifacts/shards/ \;
+          ls -lh artifacts/shards/
+
+      - name: Run Model Tuning, Ensembling & Screener
+        run: |
+          python screener_sharded.py --mode train
+
+      - name: Upload Final Prediction Leaderboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-gainers-tomorrow
+          path: artifacts/top_gainers_tomorrow.csv
+
+      - name: Commit Leaderboard to Repository (Optional)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add artifacts/top_gainers_tomorrow.csv || true
+          git diff --staged --quiet || git commit -m "chore: update tomorrow's top gainers [skip ci]"
+          git push || true
