@@ -190,7 +190,7 @@ def run_train_and_screen():
     X_train, y_train = X[train_idx], y[train_idx]
     X_test, y_test = X[test_idx], y[test_idx]
 
-    # Model Pipelines
+    # Model Pipelines with safe list constructors
     pipelines = {
         "hist_gb": {
             "pipe": Pipeline([
@@ -198,9 +198,9 @@ def run_train_and_screen():
                 ("clf", HistGradientBoostingClassifier(class_weight="balanced", random_state=42)),
             ]),
             "params": {
-                "clf__max_iter": [60, 100],
-                "clf__learning_rate": [0.03, 0.08],
-                "clf__max_leaf_nodes": [15, 31],
+                "clf__max_iter": list((60, 100)),
+                "clf__learning_rate": list((0.03, 0.08)),
+                "clf__max_leaf_nodes": list((15, 31)),
             },
         },
         "random_forest": {
@@ -209,8 +209,8 @@ def run_train_and_screen():
                 ("clf", RandomForestClassifier(class_weight="balanced", n_jobs=-1, random_state=42)),
             ]),
             "params": {
-                "clf__n_estimators": [70, 120],
-                "clf__max_depth":,
+                "clf__n_estimators": list((70, 120)),
+                "clf__max_depth": list((8, 14)),
             },
         },
         "extra_trees": {
@@ -219,8 +219,8 @@ def run_train_and_screen():
                 ("clf", ExtraTreesClassifier(class_weight="balanced", n_jobs=-1, random_state=42)),
             ]),
             "params": {
-                "clf__n_estimators": [70, 120],
-                "clf__max_depth":,
+                "clf__n_estimators": list((70, 120)),
+                "clf__max_depth": list((8, 14)),
             },
         },
         "logistic_reg": {
@@ -229,7 +229,7 @@ def run_train_and_screen():
                 ("clf", LogisticRegression(class_weight="balanced", max_iter=400, random_state=42)),
             ]),
             "params": {
-                "clf__C": [0.05, 0.5, 2.0],
+                "clf__C": list((0.05, 0.5, 2.0)),
             },
         },
     }
@@ -252,7 +252,7 @@ def run_train_and_screen():
         )
         search.fit(X_train, y_train)
 
-        # Slice column 1 (positive class probability)
+        # Slice 1D positive class probability
         probs = search.best_estimator_.predict_proba(X_test)
         preds = (probs >= 0.50).astype(int)
 
@@ -271,7 +271,7 @@ def run_train_and_screen():
     ensemble = VotingClassifier(estimators=estimators, voting="soft", weights=norm_weights)
     ensemble.fit(X_train, y_train)
 
-    # Slice column 1 for ensemble predictions
+    # Slice 1D positive class probability for ensemble
     ens_probs = ensemble.predict_proba(X_test)
     ens_roc = roc_auc_score(y_test, ens_probs) if len(np.unique(y_test)) > 1 else 0.5
     print(f"\nFinal Ensemble Holdout ROC-AUC: {ens_roc:.4f}")
