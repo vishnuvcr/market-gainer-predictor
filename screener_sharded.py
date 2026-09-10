@@ -94,13 +94,12 @@ def compute_features_and_target(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 2. CONCURRENT TICKER WORKER (THREAD-SAFE WITH RETRIES)
+# 2. CONCURRENT TICKER WORKER
 # ==============================================================================
 def fetch_single_ticker(ticker: str, period: str = "2y", max_retries: int = 3):
     yf_symbol = f"{ticker}.NS" if not ticker.endswith(".NS") else ticker
     for attempt in range(max_retries):
         try:
-            # Jitter to avoid synchronized burst requests
             time.sleep(random.uniform(0.05, 0.15))
             df = yf.download(yf_symbol, period=period, interval="1d", progress=False, auto_adjust=True)
 
@@ -112,11 +111,9 @@ def fetch_single_ticker(ticker: str, period: str = "2y", max_retries: int = 3):
 
             df = compute_features_and_target(df)
 
-            # Latest row for live screening inference
             latest_row = df.iloc[-1].copy()
             latest_row["Ticker"] = ticker
 
-            # Historical training data (excluding current incomplete target)
             train_df = df.iloc[:-1].dropna()
             train_df["Ticker"] = ticker
 
@@ -128,7 +125,7 @@ def fetch_single_ticker(ticker: str, period: str = "2y", max_retries: int = 3):
 
 
 # ==============================================================================
-# 3. SHARD RUNNER: DOWNLOAD & PROCESS PARTITION
+# 3. SHARD RUNNER
 # ==============================================================================
 def run_shard_download(ticker_file: str, shard_index: int, total_shards: int, max_workers: int = 6):
     print(f"=== Initializing Shard {shard_index + 1}/{total_shards} ===")
@@ -136,7 +133,6 @@ def run_shard_download(ticker_file: str, shard_index: int, total_shards: int, ma
     with open(ticker_file, "r") as f:
         all_tickers = sorted([line.strip().upper() for line in f if line.strip() and not line.startswith("#")])
 
-    # Interleaved round-robin partition
     my_tickers = all_tickers[shard_index::total_shards]
     print(f"Shard {shard_index} assigned {len(my_tickers)} out of {len(all_tickers)} total tickers.")
 
@@ -147,7 +143,6 @@ def run_shard_download(ticker_file: str, shard_index: int, total_shards: int, ma
         future_to_ticker = {executor.submit(fetch_single_ticker, sym): sym for sym in my_tickers}
         completed = 0
         for future in as_completed(future_to_ticker):
-            sym = future_to_ticker[future]
             completed += 1
             train_df, latest_row = future.result()
             if train_df is not None and latest_row is not None:
@@ -215,7 +210,7 @@ def run_train_and_screen():
             ]),
             "params": {
                 "clf__n_estimators": [70, 120],
-                "clf__max_depth": [8, 14],
+                "clf__max_depth":,
             },
         },
         "extra_trees": {
@@ -225,7 +220,7 @@ def run_train_and_screen():
             ]),
             "params": {
                 "clf__n_estimators": [70, 120],
-                "clf__max_depth": [8, 14],
+                "clf__max_depth":,
             },
         },
         "logistic_reg": {
@@ -239,9 +234,8 @@ def run_train_and_screen():
         },
     }
 
-    # Hyperparameter Optimization on Inner TimeSeriesSplit
+    # Inner TimeSeriesSplit for Hyperparameter Tuning
     inner_cv = TimeSeriesSplit(n_splits=3)
-    best_models = {}
     eval_weights = []
     estimators = []
 
@@ -257,11 +251,11 @@ def run_train_and_screen():
             random_state=42,
         )
         search.fit(X_train, y_train)
-        best_models[name] = search.best_estimator_
 
-        # Out-of-Sample Performance on Holdout Partition
+        # Slice column 1 (positive class probability)
         probs = search.best_estimator_.predict_proba(X_test)
         preds = (probs >= 0.50).astype(int)
+
         roc = roc_auc_score(y_test, probs) if len(np.unique(y_test)) > 1 else 0.5
         prec = precision_score(y_test, preds, zero_division=0)
         rec = recall_score(y_test, preds, zero_division=0)
@@ -277,11 +271,12 @@ def run_train_and_screen():
     ensemble = VotingClassifier(estimators=estimators, voting="soft", weights=norm_weights)
     ensemble.fit(X_train, y_train)
 
+    # Slice column 1 for ensemble predictions
     ens_probs = ensemble.predict_proba(X_test)
     ens_roc = roc_auc_score(y_test, ens_probs) if len(np.unique(y_test)) > 1 else 0.5
     print(f"\nFinal Ensemble Holdout ROC-AUC: {ens_roc:.4f}")
 
-    # Forward-Looking Inference for Tomorrow's Surge Candidates
+    # Forward-Looking Inference
     print("\n--- Running Inference for Tomorrow's Market Gainers ---")
     latest_features = latest_snapshots[FEATURE_COLS].astype(float).values
     predictions = ensemble.predict_proba(latest_features)
@@ -297,7 +292,6 @@ def run_train_and_screen():
     top_picks.to_csv("artifacts/top_gainers_tomorrow.csv", index=False)
     print("Saved predictions to artifacts/top_gainers_tomorrow.csv")
 
-    # Write Step Summary if executed inside GitHub Actions
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a") as f:
