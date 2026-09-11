@@ -102,3 +102,4 @@ jobs:
           git add artifacts/top_gainers_tomorrow.csv || true
           git diff --staged --quiet || git commit -m "chore: update tomorrow's top gainers [skip ci]"
           git push || true
+          
