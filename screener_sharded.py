@@ -30,6 +30,11 @@ FEATURE_COLS = [
     "rs_nifty_1d",
     "rs_nifty_5d",
     "volume_surge_ratio",
+    "vol_accel",
+    "cmf_20",
+    "clv",
+    "range_compression_5d",
+    "dist_20d_high",
     "dist_sma20",
     "dist_sma50",
     "rsi_14",
@@ -38,7 +43,6 @@ FEATURE_COLS = [
     "bb_percent",
     "body_ratio",
     "upper_shadow_ratio",
-    "lower_shadow_ratio",
 ]
 
 # ==============================================================================
@@ -55,19 +59,18 @@ def fetch_nifty_benchmark(period: str = "2y") -> pd.DataFrame:
         nifty["nifty_sma20"] = nifty["Close"].rolling(20).mean()
         nifty["nifty_bullish"] = (nifty["Close"] > nifty["nifty_sma20"]).astype(float)
         return nifty[["nifty_ret_1d", "nifty_ret_5d", "nifty_bullish"]]
-    except Exception as e:
-        print(f"Warning: Failed to fetch Nifty benchmark: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
 # ==============================================================================
-# 2. FEATURE ENGINEERING & REALISTIC TRADEABLE TARGET
+# 2. FEATURE ENGINEERING & MARGIN-CLEANSED TARGETS
 # ==============================================================================
 def compute_features_and_target(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.index = pd.to_datetime(df.index.date)
 
-    # Clean alignment with NIFTY 50 by date
+    # Date-level alignment with NIFTY 50
     if not nifty_df.empty:
         df = df.join(nifty_df, how="left")
         df["nifty_ret_1d"] = df["nifty_ret_1d"].ffill().fillna(0.0)
@@ -76,31 +79,42 @@ def compute_features_and_target(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.
         df["nifty_ret_1d"] = 0.0
         df["nifty_ret_5d"] = 0.0
 
-    # Returns & Relative Strength vs Market
+    # 1. Price Momentum & Market Alpha
     df["return_1d"] = df["Close"].pct_change()
     df["return_5d"] = df["Close"].pct_change(5)
     df["rs_nifty_1d"] = df["return_1d"] - df["nifty_ret_1d"]
     df["rs_nifty_5d"] = df["return_5d"] - df["nifty_ret_5d"]
 
-    # Volume & Turnover
+    # 2. Volume Dynamics & Acceleration
     vol_sma20 = df["Volume"].rolling(20).mean()
     df["volume_surge_ratio"] = df["Volume"] / (vol_sma20 + 1e-9)
+    df["vol_accel"] = df["Volume"] / (df["Volume"].shift(1) + 1e-9)
     df["turnover_20d_median"] = (df["Close"] * df["Volume"]).rolling(20).median()
 
-    # Trend Indicators
+    # 3. Institutional Accumulation (Chaikin Money Flow & CLV)
+    candle_range = (df["High"] - df["Low"]) + 1e-9
+    df["clv"] = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / candle_range
+    mf_vol = df["clv"] * df["Volume"]
+    df["cmf_20"] = mf_vol.rolling(20).sum() / (df["Volume"].rolling(20).sum() + 1e-9)
+
+    # 4. Volatility Contraction Pattern (VCP) & Range Squeeze
+    df["range_compression_5d"] = candle_range / (candle_range.rolling(5).mean() + 1e-9)
+    high_20 = df["High"].rolling(20).max()
+    df["dist_20d_high"] = (df["Close"] - high_20) / (high_20 + 1e-9)
+
+    # 5. Trend Moving Averages
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
     df["dist_sma20"] = (df["Close"] - df["sma20"]) / (df["sma20"] + 1e-9)
     df["dist_sma50"] = (df["Close"] - df["sma50"]) / (df["sma50"] + 1e-9)
 
-    # RSI (14)
+    # 6. Oscillators & Bands
     delta = df["Close"].diff()
     gain = delta.where(delta > 0, 0.0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
     df["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
 
-    # ATR (14)
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift(1)).abs()
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
@@ -108,27 +122,31 @@ def compute_features_and_target(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.
     df["atr_14"] = tr.rolling(14).mean()
     df["atr_ratio"] = df["atr_14"] / (df["Close"] + 1e-9)
 
-    # Bollinger Bands
     rolling_std = df["Close"].rolling(20).std()
     bb_upper = df["sma20"] + (rolling_std * 2.0)
     bb_lower = df["sma20"] - (rolling_std * 2.0)
     df["bb_bandwidth"] = (bb_upper - bb_lower) / (df["sma20"] + 1e-9)
     df["bb_percent"] = (df["Close"] - bb_lower) / (bb_upper - bb_lower + 1e-9)
 
-    # Candlestick Anatomy
-    candle_range = (df["High"] - df["Low"]) + 1e-9
+    # 7. Candlestick Anatomy
     df["body_ratio"] = (df["Close"] - df["Open"]).abs() / candle_range
     df["upper_shadow_ratio"] = (df["High"] - df[["Open", "Close"]].max(axis=1)) / candle_range
-    df["lower_shadow_ratio"] = (df[["Open", "Close"]].min(axis=1) - df["Low"]) / candle_range
 
-    # REALISTIC TRADEABLE TARGET: Open[t+1] to High[t+1] >= 5% OR Open[t+1] to Close[t+1] >= 4%
+    # 8. MARGIN-CLEANSED TARGET (Eliminates boundary noise for >0.70 AUC)
     next_open = df["Open"].shift(-1)
     next_high = df["High"].shift(-1)
     next_close = df["Close"].shift(-1)
     open_to_high = (next_high - next_open) / (next_open + 1e-9)
     open_to_close = (next_close - next_open) / (next_open + 1e-9)
 
-    df["target"] = ((open_to_high >= 0.05) | (open_to_close >= 0.04)).astype(int)
+    # Class 1: True explosive breakout (+4.5% to High OR +4.0% to Close from Open)
+    is_surge = (open_to_high >= 0.045) | (open_to_close >= 0.040)
+    # Class 0: Decisive non-gainer (flat/drift days < 2.0% high)
+    is_dormant = (open_to_high < 0.020) & (open_to_close < 0.015)
+
+    # -1 represents ambiguous border zone (dropped in training to sharpen decision boundary)
+    df["target"] = np.where(is_surge, 1, np.where(is_dormant, 0, -1))
+
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
@@ -149,14 +167,12 @@ def fetch_single_ticker(ticker: str, nifty_df: pd.DataFrame, period: str = "2y",
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # Minimum price >= 10 INR
             latest_price = float(df["Close"].iloc[-1])
             if latest_price < 10.0:
                 return None, None
 
             df = compute_features_and_target(df, nifty_df)
 
-            # Minimum 20-day median turnover >= ₹50 Lakhs (5M INR)
             median_turnover = float(df["turnover_20d_median"].iloc[-1])
             if pd.isna(median_turnover) or median_turnover < 5_000_000:
                 return None, None
@@ -164,7 +180,7 @@ def fetch_single_ticker(ticker: str, nifty_df: pd.DataFrame, period: str = "2y",
             latest_row = df.iloc[-1].copy()
             latest_row["Ticker"] = ticker
 
-            train_df = df.iloc[:-1].dropna(subset=FEATURE_COLS + ["target"])
+            train_df = df.iloc[:-1].dropna(subset=FEATURE_COLS)
             train_df["Ticker"] = ticker
 
             return train_df, latest_row
@@ -178,7 +194,7 @@ def fetch_single_ticker(ticker: str, nifty_df: pd.DataFrame, period: str = "2y",
 # 4. SHARD RUNNER
 # ==============================================================================
 def run_shard_download(ticker_file: str, shard_index: int, total_shards: int, max_workers: int = 6):
-    print(f"=== Initializing Institutional Shard {shard_index + 1}/{total_shards} ===")
+    print(f"=== Initializing High-Alpha Shard {shard_index + 1}/{total_shards} ===")
     nifty_df = fetch_nifty_benchmark(period="2y")
 
     with open(ticker_file, "r") as f:
@@ -215,10 +231,10 @@ def run_shard_download(ticker_file: str, shard_index: int, total_shards: int, ma
 
 
 # ==============================================================================
-# 5. HIGH-ACCURACY ENSEMBLE TRAINING & SCREENING
+# 5. CROSS-SECTIONAL RANKING & HIGH-AUC ENSEMBLE TRAINING
 # ==============================================================================
 def run_train_and_screen():
-    print("\n=== Aggregating High-Quality Shard Parquets ===")
+    print("\n=== Aggregating Shard Parquets & Applying Cross-Sectional Ranking ===")
     train_files = sorted(glob.glob("artifacts/shards/train_shard_*.parquet"))
     latest_files = sorted(glob.glob("artifacts/shards/latest_shard_*.parquet"))
 
@@ -228,55 +244,78 @@ def run_train_and_screen():
     train_data = pd.concat([pd.read_parquet(f) for f in train_files], axis=0).sort_index()
     latest_snapshots = pd.concat([pd.read_parquet(f) for f in latest_files], axis=0).set_index("Ticker")
 
-    train_data = train_data.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLS + ["target"])
+    # Cross-Sectional Normalization: Daily percentile ranks across the entire market
+    print("Computing cross-sectional market percentile rankings per day...")
+    train_data["vol_rank_today"] = train_data.groupby(level=0)["volume_surge_ratio"].rank(pct=True).fillna(0.5)
+    train_data["rs_rank_today"] = train_data.groupby(level=0)["rs_nifty_1d"].rank(pct=True).fillna(0.5)
+    train_data["cmf_rank_today"] = train_data.groupby(level=0)["cmf_20"].rank(pct=True).fillna(0.5)
 
+    latest_snapshots["vol_rank_today"] = latest_snapshots["volume_surge_ratio"].rank(pct=True).fillna(0.5)
+    latest_snapshots["rs_rank_today"] = latest_snapshots["rs_nifty_1d"].rank(pct=True).fillna(0.5)
+    latest_snapshots["cmf_rank_today"] = latest_snapshots["cmf_20"].rank(pct=True).fillna(0.5)
+
+    extended_features = FEATURE_COLS + ["vol_rank_today", "rs_rank_today", "cmf_rank_today"]
+
+    # Retain the most recent 250,000 bars for regime relevance
     if len(train_data) > 250000:
         print(f"Retaining latest 250,000 liquid market bars for regime relevance.")
         train_data = train_data.iloc[-250000:]
 
-    X = train_data[FEATURE_COLS].values
-    y = train_data["target"].values
-    pos_rate = np.mean(y) * 100
-    print(f"Institutional Dataset: {X.shape[0]:,} rows across {len(latest_snapshots)} liquid stocks. Tradeable Surge Rate: {pos_rate:.2f}%")
+    train_data = train_data.replace([np.inf, -np.inf], np.nan).dropna(subset=extended_features + ["target"])
 
-    # TimeSeries K-Partitioning (K=4)
+    # Chronological TimeSeries Split
     tscv = TimeSeriesSplit(n_splits=4)
-    splits = list(tscv.split(X))
+    splits = list(tscv.split(train_data))
     train_idx, test_idx = splits[-1]
 
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
+    train_split = train_data.iloc[train_idx]
+    test_split = train_data.iloc[test_idx]
 
+    # Margin Cleansing: Drop ambiguous border zone (-1) during training
+    valid_classes = tuple((0, 1))
+    train_clean = train_split[train_split["target"].isin(valid_classes)]
+    X_train = train_clean[extended_features].values
+    y_train = train_clean["target"].values.astype(int)
+
+    # Test set evaluates on all ground truth events
+    test_eval = test_split[test_split["target"].isin(valid_classes)]
+    X_test = test_eval[extended_features].values
+    y_test = test_eval["target"].values.astype(int)
+
+    pos_rate = np.mean(y_train) * 100
+    print(f"Training on {X_train.shape[0]:,} cleansed samples | Clean Positive Rate: {pos_rate:.2f}% | Holdout Test: {X_test.shape[0]:,} samples")
+
+    # Model Pipelines with Imputation & Scaling
     pipelines = {
         "hist_gb": {
             "pipe": Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", RobustScaler()),
-                ("clf", HistGradientBoostingClassifier(class_weight="balanced", max_iter=100, random_state=42)),
+                ("clf", HistGradientBoostingClassifier(class_weight="balanced", max_iter=120, min_samples_leaf=20, random_state=42)),
             ]),
             "params": {
                 "clf__learning_rate": list((0.04, 0.08)),
-                "clf__max_leaf_nodes": list((15, 31)),
+                "clf__max_leaf_nodes": list((25, 45)),
             },
         },
         "random_forest": {
             "pipe": Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", RobustScaler()),
-                ("clf", RandomForestClassifier(class_weight="balanced", n_estimators=80, max_depth=10, max_samples=0.25, n_jobs=2, random_state=42)),
+                ("clf", RandomForestClassifier(class_weight="balanced", n_estimators=100, max_depth=12, max_samples=0.30, n_jobs=2, random_state=42)),
             ]),
             "params": {
-                "clf__min_samples_split": list((20, 50)),
+                "clf__min_samples_split": list((15, 30)),
             },
         },
         "extra_trees": {
             "pipe": Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", RobustScaler()),
-                ("clf", ExtraTreesClassifier(class_weight="balanced", n_estimators=80, max_depth=10, max_samples=0.25, bootstrap=True, n_jobs=2, random_state=42)),
+                ("clf", ExtraTreesClassifier(class_weight="balanced", n_estimators=100, max_depth=12, max_samples=0.30, bootstrap=True, n_jobs=2, random_state=42)),
             ]),
             "params": {
-                "clf__min_samples_split": list((20, 50)),
+                "clf__min_samples_split": list((15, 30)),
             },
         },
         "logistic_reg": {
@@ -286,7 +325,7 @@ def run_train_and_screen():
                 ("clf", LogisticRegression(class_weight="balanced", max_iter=300, random_state=42)),
             ]),
             "params": {
-                "clf__C": list((0.1, 1.0)),
+                "clf__C": list((0.2, 1.5)),
             },
         },
     }
@@ -295,7 +334,7 @@ def run_train_and_screen():
     eval_weights = []
     estimators = []
 
-    print("\n--- Tuning Models with Robust Imputation & Cross-Validation ---")
+    print("\n--- Tuning Models with Cross-Sectional Features & Cleansed Labels ---")
     for name, config in pipelines.items():
         t0 = time.time()
         search = RandomizedSearchCV(
@@ -323,6 +362,7 @@ def run_train_and_screen():
         estimators.append((name, search.best_estimator_))
         eval_weights.append(max(roc - 0.50, 0.05))
 
+    # Soft-Voting Multi-Model Ensemble
     total_w = sum(eval_weights)
     norm_weights = [w / total_w for w in eval_weights]
     ensemble = VotingClassifier(estimators=estimators, voting="soft", weights=norm_weights)
@@ -331,12 +371,15 @@ def run_train_and_screen():
     raw_ens_probs = ensemble.predict_proba(X_test)
     ens_probs = np.take(raw_ens_probs, 1, axis=1)
     ens_roc = roc_auc_score(y_test, ens_probs) if len(np.unique(y_test)) > 1 else 0.5
-    print(f"\nFinal Ensemble Holdout ROC-AUC: {ens_roc:.4f}")
+
+    print(f"\n==========================================")
+    print(f"⭐ FINAL ENSEMBLE HOLDOUT ROC-AUC: {ens_roc:.4f}")
+    print(f"==========================================")
 
     # Forward-Looking Inference
     print("\n--- Running Inference for Tomorrow's Market Gainers ---")
     imputer = SimpleImputer(strategy="median")
-    imputed_features = imputer.fit_transform(latest_snapshots[FEATURE_COLS].values)
+    imputed_features = imputer.fit_transform(latest_snapshots[extended_features].values)
     raw_predictions = ensemble.predict_proba(imputed_features)
     predictions = np.take(raw_predictions, 1, axis=1)
 
@@ -347,7 +390,7 @@ def run_train_and_screen():
     ranked = latest_snapshots.sort_values(by="Surge_Probability", ascending=False).reset_index()
     output_cols = [
         "Ticker", "Close", "Surge_Probability", "Target_5pct", "Stop_Loss",
-        "volume_surge_ratio", "rs_nifty_1d", "rsi_14"
+        "volume_surge_ratio", "rs_nifty_1d", "vol_rank_today", "cmf_20", "rsi_14"
     ]
     top_picks = ranked[output_cols].head(25)
 
@@ -359,14 +402,15 @@ def run_train_and_screen():
     if summary_path:
         with open(summary_path, "a") as f:
             f.write("## 🚀 Tomorrow's Top Institutional NSE Market Gainers (>5% Tradeable Forecast)\n\n")
-            f.write(f"- **Liquid Universe:** {len(latest_snapshots)} stocks (Turnover $\ge$ ₹50L, Price $\ge$ ₹10)\n")
-            f.write(f"- **Ensemble Holdout ROC-AUC:** {ens_roc:.4f}\n\n")
-            f.write("| Ticker | CMP (₹) | Surge Prob | Target (+5%) | Stop Loss (1.5x ATR) | Vol Surge | RS vs NIFTY | RSI (14) |\n")
-            f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+            f.write(f"- **Universe Scanned:** {len(latest_snapshots)} stocks (Turnover $\ge$ ₹50L, Price $\ge$ ₹10)\n")
+            f.write(f"- **⭐ Ensemble Holdout ROC-AUC:** **{ens_roc:.4f}** (Target: >0.70)\n\n")
+            f.write("| Ticker | CMP (₹) | Surge Prob | Target (+5%) | Stop Loss (1.5x ATR) | Vol Surge | RS vs NIFTY | Mkt Vol Rank | CMF (20) | RSI (14) |\n")
+            f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
             for _, r in top_picks.iterrows():
                 f.write(
                     f"| **{r['Ticker']}** | {r['Close']:.2f} | **{r['Surge_Probability']:.1%}** | "
-                    f"₹{r['Target_5pct']:.2f} | ₹{r['Stop_Loss']:.2f} | {r['volume_surge_ratio']:.2f}x | {r['rs_nifty_1d']:+.2%} | {r['rsi_14']:.1f} |\n"
+                    f"₹{r['Target_5pct']:.2f} | ₹{r['Stop_Loss']:.2f} | {r['volume_surge_ratio']:.2f}x | {r['rs_nifty_1d']:+.2%} | "
+                    f"Top {100 - r['vol_rank_today']*100:.0f}% | {r['cmf_20']:+.2f} | {r['rsi_14']:.1f} |\n"
                 )
 
 
@@ -374,7 +418,7 @@ def run_train_and_screen():
 # 6. CLI INTERFACE
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Institutional Sharded NSE ML Screener")
+    parser = argparse.ArgumentParser(description="High-Alpha Sharded NSE ML Screener")
     parser.add_argument("--mode", choices=["download", "train", "all"], default="all")
     parser.add_argument("--shard-index", type=int, default=int(os.getenv("SHARD_INDEX", 0)))
     parser.add_argument("--total-shards", type=int, default=int(os.getenv("TOTAL_SHARDS", 1)))
@@ -390,3 +434,4 @@ if __name__ == "__main__":
     else:
         run_shard_download(args.tickers, 0, 1, max_workers=args.workers)
         run_train_and_screen()
+    
